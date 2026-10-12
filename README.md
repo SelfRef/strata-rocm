@@ -96,12 +96,18 @@ models:
         --network container:<llama-swap container name>
         --device /dev/kfd --device /dev/dri/renderD129 --device /dev/dri/card2
         --ipc=host --ulimit memlock=-1:-1 --oom-score-adj 1000
+        -e STRATA_ALLOWED_HOSTS=*
         -v strata-data:/data -v /path/to/models:/models:ro
         ghcr.io/selfref/strata-rocm:latest
         serve q2_0 --port ${PORT}
     cmdStop: docker stop -t 60 ${MODEL_ID}
     ttl: 1200
 ```
+
+`STRATA_ALLOWED_HOSTS=*` is needed behind llama-swap: Strata's DNS-rebinding guard only answers to
+localhost and IP addresses, and llama-swap forwards each client's `Host` header (e.g. `llama-swap:8080`),
+so every request from another container would get a 403. It is safe here because the server is only
+reachable through llama-swap's network namespace, behind llama-swap's own authentication.
 
 Strata takes the whole card, so put it in a llama-swap group that is exclusive with the other models on that
 GPU. The first start after a reboot loads ~38 GB of experts into RAM (~20 s from NVMe).
