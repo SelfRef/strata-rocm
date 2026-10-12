@@ -1,0 +1,198 @@
+name: Build image
+
+# Builds Strata (upstream Niko1221/Strata) with its HIP engine for AMD RDNA3
+# and publishes ghcr.io/<owner>/strata-rocm.
+#   schedule  every 4 h: resolve upstream's latest release and build only when
+#             it differs from the revision the published :latest was built from
+#   dispatch  build any upstream ref now (empty = latest release), no check
+#   push      a change to the image definition rebuilds the latest release
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - .github/workflows/build.yml
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      strata_ref:
+        description: "Upstream Strata ref to build (tag / branch / sha); empty = latest release"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Niko1221/Strata
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      ref: ${{ steps.upstream.outputs.ref }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      short: ${{ steps.upstream.outputs.short }}
+      version: ${{ steps.upstream.outputs.version }}
+      image: ${{ steps.upstream.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Dockerfile
+        run: docker build --check .
+
+      - name: Resolve upstream revision
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_INPUT: ${{ inputs.strata_ref }}
+        run: |
+          set -euo pipefail
+          ref="${REF_INPUT}"
+          if [ -z "$ref" ]; then
+            ref="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          fi
+          # ^{} peels an annotated tag to its commit
+          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${ref}^{}" "refs/tags/${ref}" "refs/heads/${ref}" | awk 'NR==1{print $1}')"
+          if [ -z "$sha" ]; then
+            [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::cannot resolve upstream ref '${ref}'"; exit 1; }
+            sha="$ref"
+          fi
+          # the engine version is the CMake project version at that commit
+          version="$(curl -fsSL "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${sha}/CMakeLists.txt" \
+                     | sed -nE 's/^project\(strata VERSION ([0-9.]+).*/\1/p' | head -1)"
+          [ -n "$version" ] || { echo "::error::project version not found at ${sha}"; exit 1; }
+          echo "ref=${ref}"         >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}"         >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}"   >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "Strata ${version} @ ${sha} (${ref})"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'schedule'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only the schedule skips: it compares upstream's release with the
+      # revision label of the published :latest (none yet = build).
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "$EVENT" = schedule ]; then
+            published="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+                          --format '{{ index .Image.Config.Labels "dev.selfref.strata.revision" }}' 2>/dev/null || true)"
+            echo "published :latest is built from: ${published:-<none>}"
+            [ "$published" = "$SHA" ] && build=false
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "build: ${build}"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    # ~10 GB of ROCm wheels plus a 10-20 min HIP compile per architecture set
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # the ROCm wheels and the image layers do not fit the runner's default free space
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # :latest + :<strata version> + :<strata version>-<upstream7> (immutable)
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.plan.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.plan.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=${{ needs.plan.outputs.version }}-${{ needs.plan.outputs.short }},enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=strata-rocm
+            org.opencontainers.image.description=Strata (Niko1221/Strata) with its HIP engine for AMD RDNA3 (gfx1100/1101/1102)
+            dev.selfref.strata.version=${{ needs.plan.outputs.version }}
+            dev.selfref.strata.revision=${{ needs.plan.outputs.sha }}
+            dev.selfref.strata.ref=${{ needs.plan.outputs.ref }}
+
+      # Plain buildx in a short retry loop: a TheRock or PyPI hiccup should not
+      # fail a scheduled run
+      - name: Build and push
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          LABELS: ${{ steps.meta.outputs.labels }}
+          PUSH: ${{ github.event_name != 'pull_request' }}
+          STRATA_SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          args=()
+          while IFS= read -r tag;   do [ -n "$tag" ]   && args+=(--tag "$tag");     done <<< "$TAGS"
+          while IFS= read -r label; do [ -n "$label" ] && args+=(--label "$label"); done <<< "$LABELS"
+          [ "$PUSH" = true ] && args+=(--push)
+          for attempt in 1 2 3; do
+            if docker buildx build --platform linux/amd64 \
+                 --build-arg "STRATA_REF=${STRATA_SHA}" \
+                 "${args[@]}" . ; then
+              exit 0
+            fi
+            echo "::warning::build attempt ${attempt} failed; retrying in 120 s"
+            sleep 120
+          done
+          echo "::error::build failed after 3 attempts"
+          exit 1
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Strata ${{ needs.plan.outputs.version }} @ \`${{ needs.plan.outputs.sha }}\` (${{ needs.plan.outputs.ref }})"
+            echo
+            echo '```'; echo "$TAGS"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
