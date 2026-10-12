@@ -65,8 +65,9 @@ jobs:
           if [ -z "$ref" ]; then
             ref="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
           fi
-          # ^{} peels an annotated tag to its commit
-          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${ref}^{}" "refs/tags/${ref}" "refs/heads/${ref}" | awk 'NR==1{print $1}')"
+          # an annotated tag lists the tag object first and its commit as <tag>^{}: take the commit
+          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${ref}^{}" "refs/tags/${ref}" "refs/heads/${ref}" \
+                 | awk '/\^\{\}$/ {peeled=$1} NR==1 {first=$1} END {print peeled ? peeled : first}')"
           if [ -z "$sha" ]; then
             [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::cannot resolve upstream ref '${ref}'"; exit 1; }
             sha="$ref"
